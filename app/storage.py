@@ -153,6 +153,67 @@ class Store:
             for r in rows
         ]
 
+    def snapshot_current(self) -> Optional[tuple[VersionMeta, list["DayRow"], int]]:
+        """同一读事务内取现行版本的元数据、全日行与封存截止日。
+
+        核查类接口要求“现行日表和封存截止日取自同一已提交状态”，
+        故在写锁保护下一次性读出，避免与补报/封存并发交叉。
+        """
+        with self._lock:
+            v = self.current_version_no()
+            if v is None:
+                return None
+            meta = self.get_version(v)
+            if meta is None:
+                return None
+            rows = self.list_days(v)
+            sealed = self.sealed_through(v)
+            return meta, rows, sealed
+
+    def conditional_seal(self, version: int, expected_sealed_through: int,
+                         through_day: int) -> dict:
+        """乐观并发封存：仅当版号仍为现行且截止日与预期一致时才写入。
+
+        确认入库期间若发生过补报（版号变化）或封存（截止日变化），
+        整体回滚并抛出 :class:`StorageError`，不新增任何封存记录。
+        """
+        now = _now()
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                cur_v = self.current_version_no()
+                if cur_v is None or cur_v != version:
+                    raise StorageError(
+                        f"版号已变化（确认时现行版={cur_v}，"
+                        f"核查版={version}），确认退回，未新增封存"
+                    )
+                cur_sealed = self.sealed_through(version)
+                if cur_sealed != expected_sealed_through:
+                    raise StorageError(
+                        f"封存截止日已变化（确认时={cur_sealed}，"
+                        f"核查时={expected_sealed_through}），确认退回，未新增封存"
+                    )
+                if through_day <= cur_sealed:
+                    raise StorageError(
+                        f"目标封存日 {through_day} 不晚于现行截止日 {cur_sealed}，"
+                        "无需封存"
+                    )
+                self._conn.execute(
+                    "INSERT INTO seals(version, through_day, sealed_at) "
+                    "VALUES (?, ?, ?)", (version, through_day, now)
+                )
+                self._conn.execute("COMMIT")
+                return {"seal_id": self._conn.execute(
+                        "SELECT last_insert_rowid() AS i").fetchone()["i"],
+                        "version": version, "through_day": through_day,
+                        "sealed_at": now}
+            except StorageError:
+                self._rollback()
+                raise
+            except Exception as exc:
+                self._rollback()
+                raise StorageError(f"条件封存失败: {exc}") from exc
+
     # ---------- 写 ----------
     def write_new_version(self, *, year: int, month: int,
                           sim_rain: tuple[int, ...], sim_total: int,

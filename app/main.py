@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from . import __version__
 from .alloc import SIM_DAYS, AllocationError, allocate
+from .audit import AuditDay, AuditPlan, Witness, plan_audit
 from .storage import DayRow, StorageError, Store
 
 DB_PATH = os.environ.get("RAIN_DB_PATH", "/data/rain.db")
@@ -87,6 +88,53 @@ class RecomputeRequest(BaseModel):
 
 class SealRequest(BaseModel):
     through_day: int = Field(..., ge=1, description="封存从月初到该日（含）")
+
+
+class AuditCheckRequest(BaseModel):
+    n: int = Field(..., ge=1, description="连续窗口天数 N（1 至当月天数）")
+    threshold: int = Field(..., ge=0,
+                           description="达标阈值，非负整数，单位十分之一毫米")
+
+
+class AuditConfirmRequest(BaseModel):
+    n: int = Field(..., ge=1, description="原核查参数：连续窗口天数 N")
+    threshold: int = Field(..., ge=0, description="原核查参数：达标阈值")
+    version: int = Field(..., ge=1, description="原核查返回的版号")
+    original_sealed_through: int = Field(
+        ..., ge=0, description="原核查返回的封存截止日（未封存为 0）")
+
+
+class WitnessOut(BaseModel):
+    sealed_through: int = Field(description="少封一天时的截止日")
+    count_a: int
+    table_a: list[int]
+    count_b: int
+    table_b: list[int]
+
+
+class AuditCheckOut(BaseModel):
+    version: int
+    n: int
+    threshold: int
+    calendar_days: int
+    original_sealed_through: int
+    current_count: int = Field(description="现行日表自身的达标次数")
+    unique_count: int = Field(description="封存到建议日期后，所有候选的唯一次数")
+    suggested_sealed_through: int
+    needs_extension: bool
+    candidate_count: int = Field(description="与现行已封存/核准状态相容的候选表数")
+    witness: Optional[WitnessOut] = Field(
+        None, description="需延长封存时，少封一天次数不同的两张候选表")
+
+
+class AuditConfirmOut(BaseModel):
+    version: int
+    n: int
+    threshold: int
+    sealed_through: int
+    unique_count: int
+    extended: bool = Field(description="本次确认是否实际新增了封存")
+    sealed_at: Optional[str] = None
 
 
 class DayOut(BaseModel):
@@ -337,3 +385,120 @@ def cumulative(through_day: int, version: Optional[int] = None) -> dict:
             for r in part
         ],
     }
+
+
+# ---------------- 月报核查 / 确认 ----------------
+def _audit_days(rows: list[DayRow], sealed_through: int) -> list[AuditDay]:
+    """同一快照内构造核查日列：封存日与核准日照录钉死。"""
+    return [
+        AuditDay(
+            day=r.day,
+            amount=r.amount,
+            exact=Fraction(r.exact_num, r.exact_den),
+            fixed=(r.day <= sealed_through or r.source == "approved"),
+        )
+        for r in rows
+    ]
+
+
+def _plan_to_out(plan: AuditPlan) -> AuditCheckOut:
+    witness = None
+    if plan.witness is not None:
+        w: Witness = plan.witness
+        witness = WitnessOut(
+            sealed_through=w.sealed_through,
+            count_a=w.count_a, table_a=list(w.table_a),
+            count_b=w.count_b, table_b=list(w.table_b),
+        )
+    return AuditCheckOut(
+        version=plan.version,
+        n=plan.n,
+        threshold=plan.threshold,
+        calendar_days=plan.calendar_days,
+        original_sealed_through=plan.original_sealed_through,
+        current_count=plan.current_count,
+        unique_count=plan.unique_count,
+        suggested_sealed_through=plan.suggested_sealed_through,
+        needs_extension=plan.needs_extension,
+        candidate_count=plan.candidate_count,
+        witness=witness,
+    )
+
+
+@app.post("/audit/check", tags=["audit"], response_model=AuditCheckOut,
+          summary="月报核查：求最少封存到哪天，达标次数在所有剩余候选中唯一")
+def audit_check(req: AuditCheckRequest) -> AuditCheckOut:
+    snap = store.snapshot_current()
+    if snap is None:
+        raise HTTPException(409, "尚无现行版本，请先调用 /convert")
+    meta, rows, sealed_through = snap
+    if not 1 <= req.n <= len(rows):
+        raise HTTPException(422, f"N 须在 1..{len(rows)}（当月天数）之间")
+    days = _audit_days(rows, sealed_through)
+    try:
+        plan = plan_audit(
+            days, n=req.n, threshold=req.threshold,
+            version=meta.version, original_sealed_through=sealed_through,
+        )
+    except ValueError as exc:
+        # 走到这里说明已提交状态不满足服务自身的取整不变量，属内部错误。
+        raise HTTPException(500, f"核查失败：{exc}") from exc
+    return _plan_to_out(plan)
+
+
+@app.post("/audit/confirm", tags=["audit"], response_model=AuditConfirmOut,
+          summary="凭原参数、版号、原截止日确认；需要时条件封存，已足够则直接返回")
+def audit_confirm(req: AuditConfirmRequest) -> AuditConfirmOut:
+    snap = store.snapshot_current()
+    if snap is None:
+        raise HTTPException(409, "尚无现行版本，请先调用 /convert")
+    meta, rows, sealed_through = snap
+    if not 1 <= req.n <= len(rows):
+        raise HTTPException(422, f"N 须在 1..{len(rows)}（当月天数）之间")
+
+    # 先重算一遍，确保原参数仍可得出结论；版号/截止日不符直接退回。
+    if meta.version != req.version:
+        raise HTTPException(
+            409,
+            f"版号已变化（现行版={meta.version}，核查版={req.version}），"
+            "确认退回，未新增封存",
+        )
+    if sealed_through != req.original_sealed_through:
+        raise HTTPException(
+            409,
+            f"封存截止日已变化（现行截止日={sealed_through}，"
+            f"核查时={req.original_sealed_through}），确认退回，未新增封存",
+        )
+
+    days = _audit_days(rows, sealed_through)
+    try:
+        plan = plan_audit(
+            days, n=req.n, threshold=req.threshold,
+            version=meta.version, original_sealed_through=sealed_through,
+        )
+    except ValueError as exc:
+        raise HTTPException(500, f"确认失败：{exc}") from exc
+
+    extended = False
+    sealed_at: Optional[str] = None
+    if plan.needs_extension:
+        try:
+            info = store.conditional_seal(
+                version=req.version,
+                expected_sealed_through=req.original_sealed_through,
+                through_day=plan.suggested_sealed_through,
+            )
+        except StorageError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        extended = True
+        sealed_at = info["sealed_at"]
+
+    return AuditConfirmOut(
+        version=meta.version,
+        n=req.n,
+        threshold=req.threshold,
+        sealed_through=plan.suggested_sealed_through,
+        unique_count=plan.unique_count,
+        extended=extended,
+        sealed_at=sealed_at,
+    )
